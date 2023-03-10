@@ -30,6 +30,10 @@ thread_local = "1.1"
 scopeguard = "1.1"
 xngin-storage = { version = "0.1.0", path = "../xngin-storage" }
 semistr = "0.1"
+fxd = "0.1"
+xngin-sql = { version = "0.1.0", path = "../xngin-sql" }
+xngin-catalog = { version = "0.1.0", path = "../xngin-catalog" }
+xngin-plan = { version = "0.1.0", path = "../xngin-plan" }
 
 [dev-dependencies]
 async-task = "4.2"
