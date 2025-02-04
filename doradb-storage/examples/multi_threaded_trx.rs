@@ -1,10 +1,14 @@
 //! Multi-threaded transaction processing.
 //! This example runs empty transactions via multiple threads.
 //! Its goal is to testing system bottleneck on starting and committing transactions.
+use byte_unit::{Byte, ParseError};
 use clap::Parser;
 use crossbeam_utils::sync::WaitGroup;
+use doradb_storage::buffer::FixedBufferPool;
+use doradb_storage::catalog::Catalog;
 use doradb_storage::session::Session;
-use doradb_storage::trx::sys::{LogSync, TransactionSystem, TrxSysConfig};
+use doradb_storage::trx::log::LogSync;
+use doradb_storage::trx::sys::{TransactionSystem, TrxSysConfig};
 use easy_parallel::Parallel;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +19,8 @@ use std::time::Instant;
 fn main() {
     let args = Args::parse();
 
+    let buf_pool = FixedBufferPool::with_capacity_static(128 * 1024 * 1024).unwrap();
+    let catalog = Catalog::<FixedBufferPool>::empty_static();
     let trx_sys = TrxSysConfig::default()
         .log_file_prefix(args.log_file_prefix.to_string())
         .log_partitions(args.log_partitions)
@@ -24,7 +30,7 @@ fn main() {
         .log_drop(args.log_drop)
         .max_io_size(args.max_io_size)
         .gc(args.gc_enabled)
-        .build_static();
+        .build_static(buf_pool, catalog);
     {
         let start = Instant::now();
         let wg = WaitGroup::new();
@@ -35,7 +41,8 @@ fn main() {
         for _ in 0..args.sessions {
             let wg = wg.clone();
             let stop = Arc::clone(&stop);
-            ex.spawn(worker(trx_sys, stop, wg)).detach();
+            ex.spawn(worker(buf_pool, catalog, trx_sys, stop, wg))
+                .detach();
         }
         // start system threads.
         let _ = Parallel::new()
@@ -81,17 +88,25 @@ fn main() {
     }
     unsafe {
         TransactionSystem::drop_static(trx_sys);
+        Catalog::drop_static(catalog);
+        FixedBufferPool::drop_static(buf_pool);
     }
 }
 
 #[inline]
-async fn worker(trx_sys: &TransactionSystem, stop: Arc<AtomicBool>, wg: WaitGroup) {
+async fn worker(
+    buf_pool: &FixedBufferPool,
+    catalog: &Catalog<FixedBufferPool>,
+    trx_sys: &TransactionSystem,
+    stop: Arc<AtomicBool>,
+    wg: WaitGroup,
+) {
     let mut session = Session::new();
     let stop = &*stop;
     while !stop.load(Ordering::Relaxed) {
         let mut trx = session.begin_trx(trx_sys);
         trx.add_pseudo_redo_log_entry();
-        match trx_sys.commit(trx).await {
+        match trx_sys.commit(trx, buf_pool, &catalog).await {
             Ok(s) => session = s,
             Err(_) => return,
         }
@@ -127,10 +142,10 @@ struct Args {
     log_drop: bool,
 
     /// size of log file
-    #[arg(long, default_value = "1073741824")]
+    #[arg(long, default_value = "1GiB", value_parser = parse_byte_size)]
     log_file_max_size: usize,
 
-    #[arg(long, default_value = "8192")]
+    #[arg(long, default_value = "8KiB", value_parser = parse_byte_size)]
     max_io_size: usize,
 
     #[arg(long, default_value = "32")]
@@ -139,4 +154,9 @@ struct Args {
     /// whether to enable GC
     #[arg(long)]
     gc_enabled: bool,
+}
+
+#[inline]
+fn parse_byte_size(input: &str) -> Result<usize, ParseError> {
+    Byte::parse_str(input, true).map(|b| b.as_u64() as usize)
 }
